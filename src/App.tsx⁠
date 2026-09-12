@@ -1,0 +1,595 @@
+import React, { useState, useEffect } from 'react';
+import { Product, FifoLot, Transaction, TransactionItem, ActivityLog, UndoState, ActiveTab, AppConfig } from './types';
+import { INITIAL_PRODUCTS, INITIAL_FIFO_LOTS, INITIAL_TRANSACTIONS, INITIAL_LOGS } from './data/initialData';
+import { soundFx } from './utils/audio';
+import { GoogleSheetsState, syncAllDataToGoogleSheets } from './utils/googleSheets';
+import { Header } from './components/Header';
+import { Navigation } from './components/Navigation';
+import { OverviewView } from './components/views/OverviewView';
+import { SellView } from './components/views/SellView';
+import { ProductsView } from './components/views/ProductsView';
+import { AlertsView } from './components/views/AlertsView';
+import { StockInView } from './components/views/StockInView';
+import { SalesAnalyticsView } from './components/views/SalesAnalyticsView';
+import { ReportsLogsView } from './components/views/ReportsLogsView';
+import { RestockModal } from './components/modals/RestockModal';
+import { GoogleSheetsModal } from './components/modals/GoogleSheetsModal';
+
+export default function App() {
+  // Application State with Permanent LocalStorage Persistence
+  const [products, setProducts] = useState<Product[]>(() => {
+    try {
+      const savedV4 = localStorage.getItem('stock_products_v4');
+      if (savedV4) {
+        const parsed = JSON.parse(savedV4);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+      const savedV3 = localStorage.getItem('stock_products_v3');
+      if (savedV3) {
+        const parsed = JSON.parse(savedV3);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch (e) {
+      console.error('Error loading products from localStorage:', e);
+    }
+    return INITIAL_PRODUCTS;
+  });
+
+  const [lots, setLots] = useState<FifoLot[]>(() => {
+    try {
+      const savedV4 = localStorage.getItem('stock_lots_v4');
+      if (savedV4) return JSON.parse(savedV4);
+      const savedV3 = localStorage.getItem('stock_lots_v3');
+      if (savedV3) return JSON.parse(savedV3);
+    } catch (e) {
+      console.error('Error loading lots from localStorage:', e);
+    }
+    return INITIAL_FIFO_LOTS;
+  });
+
+  const [transactions, setTransactions] = useState<Transaction[]>(() => {
+    try {
+      const savedV4 = localStorage.getItem('stock_tx_v4');
+      if (savedV4) return JSON.parse(savedV4);
+      const savedV3 = localStorage.getItem('stock_tx_v3');
+      if (savedV3) return JSON.parse(savedV3);
+    } catch (e) {
+      console.error('Error loading transactions from localStorage:', e);
+    }
+    return INITIAL_TRANSACTIONS;
+  });
+
+  const [logs, setLogs] = useState<ActivityLog[]>(() => {
+    try {
+      const savedV4 = localStorage.getItem('stock_logs_v4');
+      if (savedV4) return JSON.parse(savedV4);
+      const savedV3 = localStorage.getItem('stock_logs_v3');
+      if (savedV3) return JSON.parse(savedV3);
+    } catch (e) {
+      console.error('Error loading logs from localStorage:', e);
+    }
+    return INITIAL_LOGS;
+  });
+
+  const [undoState, setUndoState] = useState<UndoState | null>(null);
+  const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
+
+  // Config & Audio
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
+    const saved = localStorage.getItem('stock_sound_enabled');
+    return saved !== 'false';
+  });
+
+  // Google Sheets State
+  const [sheetsState, setSheetsState] = useState<GoogleSheetsState>(() => {
+    const savedToken = localStorage.getItem('stock_sheets_token');
+    const savedSheetId = localStorage.getItem('stock_sheets_id');
+    const savedSheetUrl = localStorage.getItem('stock_sheets_url');
+    const savedEmail = localStorage.getItem('stock_sheets_email');
+    return {
+      accessToken: savedToken || null,
+      spreadsheetId: savedSheetId || null,
+      spreadsheetUrl: savedSheetUrl || null,
+      userEmail: savedEmail || null,
+      isSyncing: false,
+      lastSyncTime: null,
+      error: null,
+    };
+  });
+
+  // Modal States
+  const [isRestockModalOpen, setIsRestockModalOpen] = useState(false);
+  const [isSheetsModalOpen, setIsSheetsModalOpen] = useState(false);
+
+  // Sync to LocalStorage immediately and synchronously
+  useEffect(() => {
+    try {
+      localStorage.setItem('stock_products_v4', JSON.stringify(products));
+      localStorage.setItem('stock_products_v3', JSON.stringify(products));
+    } catch (e) {
+      console.error('Failed to persist products:', e);
+    }
+  }, [products]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('stock_lots_v4', JSON.stringify(lots));
+      localStorage.setItem('stock_lots_v3', JSON.stringify(lots));
+    } catch (e) {
+      console.error('Failed to persist lots:', e);
+    }
+  }, [lots]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('stock_tx_v4', JSON.stringify(transactions));
+      localStorage.setItem('stock_tx_v3', JSON.stringify(transactions));
+    } catch (e) {
+      console.error('Failed to persist transactions:', e);
+    }
+  }, [transactions]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('stock_logs_v4', JSON.stringify(logs));
+      localStorage.setItem('stock_logs_v3', JSON.stringify(logs));
+    } catch (e) {
+      console.error('Failed to persist logs:', e);
+    }
+  }, [logs]);
+
+  useEffect(() => {
+    soundFx.setEnabled(soundEnabled);
+    localStorage.setItem('stock_sound_enabled', String(soundEnabled));
+  }, [soundEnabled]);
+
+  useEffect(() => {
+    if (sheetsState.accessToken) localStorage.setItem('stock_sheets_token', sheetsState.accessToken);
+    if (sheetsState.spreadsheetId) localStorage.setItem('stock_sheets_id', sheetsState.spreadsheetId);
+    if (sheetsState.spreadsheetUrl) localStorage.setItem('stock_sheets_url', sheetsState.spreadsheetUrl);
+    if (sheetsState.userEmail) localStorage.setItem('stock_sheets_email', sheetsState.userEmail);
+  }, [sheetsState]);
+
+  // Background Auto-sync helper
+  const triggerAutoSyncSheets = (
+    currentProducts: Product[],
+    currentTx: Transaction[],
+    currentLots: FifoLot[]
+  ) => {
+    if (sheetsState.accessToken && sheetsState.spreadsheetId) {
+      setSheetsState((prev) => ({ ...prev, isSyncing: true }));
+      syncAllDataToGoogleSheets(
+        sheetsState.accessToken,
+        sheetsState.spreadsheetId,
+        currentProducts,
+        currentTx,
+        currentLots
+      )
+        .then(() => {
+          setSheetsState((prev) => ({
+            ...prev,
+            isSyncing: false,
+            lastSyncTime: new Date().toLocaleTimeString('th-TH'),
+          }));
+        })
+        .catch(() => {
+          setSheetsState((prev) => ({ ...prev, isSyncing: false }));
+        });
+    }
+  };
+
+  // Log activity helper
+  const addActivityLog = (action: string, details: string, type: ActivityLog['type']) => {
+    const newLog: ActivityLog = {
+      id: 'LOG-' + Math.floor(1000 + Math.random() * 9000),
+      action,
+      details,
+      timestamp: new Date().toISOString(),
+      type,
+    };
+    setLogs((prev) => [newLog, ...prev]);
+  };
+
+  // Alert counters
+  const lowStockCount = products.filter((p) => p.currentStock > 0 && p.currentStock <= p.minAlertStock).length;
+  const outOfStockCount = products.filter((p) => p.currentStock === 0).length;
+
+  // 1-Click Quick Sell (From Overview or Sell view)
+  const handleQuickSellOneItem = (product: Product) => {
+    if (product.currentStock <= 0) {
+      soundFx.play('alert');
+      alert(`"${product.name}" สินค้าหมด`);
+      return;
+    }
+    const items: TransactionItem[] = [
+      {
+        productId: product.id,
+        productName: product.name,
+        quantity: 1,
+        unitPrice: product.salePrice,
+        unitCost: product.costPrice,
+        totalPrice: product.salePrice,
+        totalCost: product.costPrice,
+      },
+    ];
+    handleCompleteSale(items, 'Quick Sell');
+  };
+
+  // Complete Sale & FIFO Lot Deduction
+  const handleCompleteSale = (items: TransactionItem[], note: string = ''): Transaction => {
+    // 1. Save Undo State before applying sale
+    const affectedProducts = items.map((item) => {
+      const p = products.find((prod) => prod.id === item.productId);
+      return {
+        productId: item.productId,
+        previousStock: p ? p.currentStock : 0,
+      };
+    });
+
+    const txId = 'TX-' + Math.floor(1000 + Math.random() * 9000);
+    const totalAmount = items.reduce((sum, i) => sum + i.totalPrice, 0);
+    const totalCost = items.reduce((sum, i) => sum + i.totalCost, 0);
+    const totalProfit = totalAmount - totalCost;
+
+    const newTx: Transaction = {
+      id: txId,
+      type: 'SALE',
+      items,
+      totalAmount,
+      totalProfit,
+      note,
+      timestamp: new Date().toISOString(),
+      syncedToSheets: false,
+    };
+
+    // 2. Deduct product stocks
+    const updatedProducts = products.map((prod) => {
+      const matchItem = items.find((i) => i.productId === prod.id);
+      if (matchItem) {
+        const nextStock = Math.max(0, prod.currentStock - matchItem.quantity);
+        return { ...prod, currentStock: nextStock, updatedAt: new Date().toISOString() };
+      }
+      return prod;
+    });
+
+    // 3. Deduct FIFO lots
+    const updatedLots = [...lots];
+    items.forEach((item) => {
+      let needed = item.quantity;
+      for (let i = 0; i < updatedLots.length && needed > 0; i++) {
+        if (updatedLots[i].productId === item.productId && updatedLots[i].quantity > 0) {
+          const deduct = Math.min(updatedLots[i].quantity, needed);
+          updatedLots[i] = {
+            ...updatedLots[i],
+            quantity: updatedLots[i].quantity - deduct,
+          };
+          needed -= deduct;
+        }
+      }
+    });
+
+    setProducts(updatedProducts);
+    setLots(updatedLots);
+    setTransactions((prev) => [newTx, ...prev]);
+
+    setUndoState({
+      transaction: newTx,
+      affectedProducts,
+      timestamp: new Date().toISOString(),
+    });
+
+    addActivityLog(
+      `ขายสินค้า #${txId}`,
+      `${items.map((i) => `${i.productName} (x${i.quantity})`).join(', ')} รวม ${totalAmount} บาท`,
+      'sale'
+    );
+
+    triggerAutoSyncSheets(updatedProducts, [newTx, ...transactions], updatedLots);
+    return newTx;
+  };
+
+  // Stock-In Handler
+  const handleStockIn = (
+    product: Product,
+    quantity: number,
+    costPrice: number,
+    expiryDate?: string,
+    lotNumber?: string
+  ) => {
+    const updatedProducts = products.map((p) => {
+      if (p.id === product.id) {
+        return {
+          ...p,
+          currentStock: p.currentStock + quantity,
+          costPrice, // update cost price if changed
+          updatedAt: new Date().toISOString(),
+        };
+      }
+      return p;
+    });
+
+    const newLot: FifoLot = {
+      id: 'LOT-' + Math.floor(10000 + Math.random() * 90000),
+      productId: product.id,
+      productName: product.name,
+      lotNumber: lotNumber || 'LOT-' + new Date().toISOString().slice(2, 10).replace(/-/g, ''),
+      quantity,
+      costPrice,
+      receivedDate: new Date().toISOString().split('T')[0],
+      expiryDate,
+    };
+
+    const updatedLots = [newLot, ...lots];
+    const txId = 'TX-IN-' + Math.floor(1000 + Math.random() * 9000);
+
+    const newTx: Transaction = {
+      id: txId,
+      type: 'STOCK_IN',
+      items: [
+        {
+          productId: product.id,
+          productName: product.name,
+          quantity,
+          unitPrice: product.salePrice,
+          unitCost: costPrice,
+          totalPrice: product.salePrice * quantity,
+          totalCost: costPrice * quantity,
+        },
+      ],
+      totalAmount: costPrice * quantity,
+      totalProfit: 0,
+      timestamp: new Date().toISOString(),
+    };
+
+    setProducts(updatedProducts);
+    setLots(updatedLots);
+    setTransactions((prev) => [newTx, ...prev]);
+
+    addActivityLog(
+      `รับสินค้าเข้า #${txId}`,
+      `${product.name} จำนวน +${quantity} (ล็อต ${newLot.lotNumber})`,
+      'stock_in'
+    );
+
+    triggerAutoSyncSheets(updatedProducts, [newTx, ...transactions], updatedLots);
+  };
+
+  // Quick Restock from Modal or Alerts
+  const handleQuickRestock = (product: Product, quantity: number) => {
+    handleStockIn(product, quantity, product.costPrice);
+  };
+
+  // Undo Last Transaction Action
+  const handleUndoLastAction = () => {
+    if (!undoState) return;
+    soundFx.play('undo');
+
+    const txToUndo = undoState.transaction;
+
+    // Restore affected product stocks
+    const updatedProducts = products.map((p) => {
+      const savedState = undoState.affectedProducts.find((item) => item.productId === p.id);
+      if (savedState) {
+        return { ...p, currentStock: savedState.previousStock, updatedAt: new Date().toISOString() };
+      }
+      return p;
+    });
+
+    // Remove or mark transaction
+    const updatedTx = transactions.filter((t) => t.id !== txToUndo.id);
+
+    setProducts(updatedProducts);
+    setTransactions(updatedTx);
+    setUndoState(null);
+
+    addActivityLog(
+      `ยกเลิกรายการ #${txToUndo.id}`,
+      `ยกเลิกการขายย้อนหลังสำเร็จ`,
+      'undo'
+    );
+
+    triggerAutoSyncSheets(updatedProducts, updatedTx, lots);
+  };
+
+  // Product CRUD
+  const handleAddProduct = (newProductData: Omit<Product, 'createdAt' | 'updatedAt'>) => {
+    const newProduct: Product = {
+      ...newProductData,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const updated = [newProduct, ...products];
+    setProducts(updated);
+    addActivityLog('เพิ่มสินค้าใหม่', `เพิ่ม ${newProduct.name} เข้าสู่ระบบ`, 'edit');
+    triggerAutoSyncSheets(updated, transactions, lots);
+  };
+
+  const handleEditProduct = (updatedProduct: Product) => {
+    const updated = products.map((p) => (p.id === updatedProduct.id ? updatedProduct : p));
+    setProducts(updated);
+    addActivityLog('แก้ไขข้อมูลสินค้า', `แก้ไข ${updatedProduct.name}`, 'edit');
+    triggerAutoSyncSheets(updated, transactions, lots);
+  };
+
+  const handleDeleteProduct = (id: string) => {
+    const target = products.find((p) => p.id === id);
+    const updated = products.filter((p) => p.id !== id);
+    setProducts(updated);
+    addActivityLog('ลบสินค้า', `ลบ ${target?.name || id} ออกจากระบบ`, 'edit');
+    triggerAutoSyncSheets(updated, transactions, lots);
+  };
+
+  const handleToggleFrequent = (id: string) => {
+    soundFx.play('click');
+    setProducts((prev) =>
+      prev.map((p) => (p.id === id ? { ...p, frequentUse: !p.frequentUse } : p))
+    );
+  };
+
+  // Full System Data Backup & Restore
+  const handleExportBackup = () => {
+    soundFx.play('click');
+    const backupData = {
+      appName: 'Grocery Stock App',
+      version: '4.0',
+      exportedAt: new Date().toISOString(),
+      products,
+      lots,
+      transactions,
+      logs,
+    };
+    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(backupData, null, 2));
+    const downloadAnchor = document.createElement('a');
+    downloadAnchor.setAttribute('href', dataStr);
+    downloadAnchor.setAttribute('download', `grocery-stock-backup-${new Date().toISOString().slice(0, 10)}.json`);
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
+  };
+
+  const handleImportBackup = (jsonData: any) => {
+    if (!jsonData || !Array.isArray(jsonData.products)) {
+      alert('รูปแบบไฟล์ JSON ไม่ถูกต้อง');
+      return;
+    }
+    setProducts(jsonData.products);
+    if (Array.isArray(jsonData.lots)) setLots(jsonData.lots);
+    if (Array.isArray(jsonData.transactions)) setTransactions(jsonData.transactions);
+    if (Array.isArray(jsonData.logs)) setLogs(jsonData.logs);
+    addActivityLog('นำเข้าข้อมูลสำรอง', `นำเข้าข้อมูลสินค้า (${jsonData.products.length} รายการ)`, 'edit');
+    alert(`นำเข้าข้อมูลเรียบร้อยแล้ว (${jsonData.products.length} รายการ)`);
+  };
+
+  const handleResetData = () => {
+    soundFx.play('alert');
+    if (window.confirm('คุณต้องการรีเซ็ตข้อมูลทั้งหมดกลับเป็นค่าเริ่มต้นหรือไม่?')) {
+      try {
+        localStorage.removeItem('stock_products_v4');
+        localStorage.removeItem('stock_products_v3');
+        localStorage.removeItem('stock_lots_v4');
+        localStorage.removeItem('stock_lots_v3');
+        localStorage.removeItem('stock_tx_v4');
+        localStorage.removeItem('stock_tx_v3');
+        localStorage.removeItem('stock_logs_v4');
+        localStorage.removeItem('stock_logs_v3');
+      } catch (e) {
+        console.error('Error clearing localStorage:', e);
+      }
+      setProducts(INITIAL_PRODUCTS);
+      setLots(INITIAL_FIFO_LOTS);
+      setTransactions(INITIAL_TRANSACTIONS);
+      setLogs(INITIAL_LOGS);
+      alert('รีเซ็ตข้อมูลเรียบร้อยแล้ว');
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-purple-100/70 via-fuchsia-50/50 to-indigo-100/60 text-slate-800 font-sans antialiased selection:bg-purple-500 selection:text-white">
+      {/* Header */}
+      <Header
+        lowStockCount={lowStockCount}
+        outOfStockCount={outOfStockCount}
+        canUndo={!!undoState}
+        onUndo={handleUndoLastAction}
+        onOpenRestockModal={() => setIsRestockModalOpen(true)}
+        onOpenSheetsModal={() => setIsSheetsModalOpen(true)}
+        sheetsConnected={!!sheetsState.accessToken && !!sheetsState.spreadsheetId}
+        isSyncing={sheetsState.isSyncing}
+        soundEnabled={soundEnabled}
+        onToggleSound={() => setSoundEnabled(!soundEnabled)}
+        onOpenScanner={() => setActiveTab('sell')}
+      />
+
+      {/* Main View Container */}
+      <main className="max-w-7xl mx-auto px-3 sm:px-4 py-4 pb-24">
+        {activeTab === 'overview' && (
+          <OverviewView
+            products={products}
+            transactions={transactions}
+            logs={logs}
+            undoState={undoState}
+            onUndo={handleUndoLastAction}
+            onOpenRestockModal={() => setIsRestockModalOpen(true)}
+            onQuickSell={handleQuickSellOneItem}
+            onNavigateTab={setActiveTab}
+          />
+        )}
+        {activeTab === 'sell' && (
+          <SellView
+            products={products}
+            lots={lots}
+            onCompleteSale={handleCompleteSale}
+            undoState={undoState}
+            onUndo={handleUndoLastAction}
+          />
+        )}
+        {activeTab === 'products' && (
+          <ProductsView
+            products={products}
+            onAddProduct={handleAddProduct}
+            onEditProduct={handleEditProduct}
+            onDeleteProduct={handleDeleteProduct}
+            onToggleFrequent={handleToggleFrequent}
+          />
+        )}
+        {activeTab === 'alerts' && (
+          <AlertsView
+            products={products}
+            lots={lots}
+            onQuickRestock={handleQuickRestock}
+            onOpenRestockModal={() => setIsRestockModalOpen(true)}
+          />
+        )}
+        {activeTab === 'stock_in' && (
+          <StockInView
+            products={products}
+            lots={lots}
+            onStockIn={handleStockIn}
+          />
+        )}
+        {activeTab === 'sales' && (
+          <SalesAnalyticsView
+            transactions={transactions}
+            products={products}
+          />
+        )}
+        {activeTab === 'reports' && (
+          <ReportsLogsView
+            logs={logs}
+            transactions={transactions}
+            onOpenSheetsModal={() => setIsSheetsModalOpen(true)}
+            sheetsConnected={!!sheetsState.accessToken && !!sheetsState.spreadsheetId}
+            onExportBackup={handleExportBackup}
+            onImportBackup={handleImportBackup}
+            onResetData={handleResetData}
+          />
+        )}
+      </main>
+
+      {/* Bottom Sticky Navigation */}
+      <Navigation
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
+        lowStockCount={lowStockCount + outOfStockCount}
+        expiryCount={2}
+      />
+
+      {/* Modals */}
+      <RestockModal
+        isOpen={isRestockModalOpen}
+        onClose={() => setIsRestockModalOpen(false)}
+        products={products}
+        onQuickRestock={handleQuickRestock}
+      />
+      <GoogleSheetsModal
+        isOpen={isSheetsModalOpen}
+        onClose={() => setIsSheetsModalOpen(false)}
+        sheetsState={sheetsState}
+        onUpdateSheetsState={setSheetsState}
+        products={products}
+        transactions={transactions}
+        lots={lots}
+      />
+    </div>
+  );
+}
